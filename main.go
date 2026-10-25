@@ -21,13 +21,10 @@ func main() {
 		log.Fatal("MINIMAP_RELAY_TOKEN must contain at least 32 characters")
 	}
 
-	port := strings.TrimSpace(os.Getenv("PORT"))
-	if port == "" {
-		port = "8080"
-	}
+	port := configuredPort()
 	portNumber, err := strconv.Atoi(port)
 	if err != nil || portNumber < 1 || portNumber > 65535 {
-		log.Fatal("PORT must be a number between 1 and 65535")
+		log.Fatal("SERVER_PORT/PORT must be a number between 1 and 65535")
 	}
 
 	ttl := defaultRouteTTL
@@ -62,4 +59,14 @@ func main() {
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+}
+
+func configuredPort() string {
+	if port := strings.TrimSpace(os.Getenv("SERVER_PORT")); port != "" {
+		return port
+	}
+	if port := strings.TrimSpace(os.Getenv("PORT")); port != "" {
+		return port
+	}
+	return "8080"
 }

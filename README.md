@@ -1,6 +1,6 @@
 # MiniMap Route Relay
 
-A small Go service that relays the active MiniMap route between the iPhone app and the Redmi watch over HTTPS. The hosting platform terminates HTTPS; the Go process listens on its assigned `PORT`.
+A small Go service that relays the active MiniMap route between the iPhone app and the Redmi watch over HTTPS. The hosting platform terminates HTTPS; the Go process listens on `SERVER_PORT` (and falls back to `PORT` for other hosts).
 
 ## API
 
@@ -20,7 +20,7 @@ The service keeps one route in RAM and expires it after five minutes by default.
 3. Add an environment variable named `MINIMAP_RELAY_TOKEN` with a random value of at least 32 characters. Keep the same value private and configure the iPhone publisher and watch reader with it.
 4. Deploy. Use the HTTPS domain assigned by the host for both clients; do not configure an IP address.
 
-Botkeep's HTTPS proxy should forward requests to the process port provided in `PORT`. Do not hard-code a port or commit the token.
+Botkeep provides the process port in `SERVER_PORT`; the server binds to that port on all interfaces. Configure an HTTPS hostname in Botkeep's Domains tab and use that hostname from both clients. Do not hard-code a port or commit the token.
 
 ## Local development
 
