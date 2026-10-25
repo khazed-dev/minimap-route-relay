@@ -1,11 +1,17 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"mime"
 	"net/http"
 	"strings"
@@ -18,6 +24,11 @@ const (
 	maxGeometryBytes  = 48 * 1024
 	maxRouteSteps     = 300
 	maxRouteIndex     = 12000
+	pairCodeTTL       = 2 * time.Minute
+	pairNonceSize     = 32
+	maxPairSessions   = 8
+	pairStartLimit    = 6
+	pairClaimLimit    = 30
 )
 
 var unavailableRoute = []byte(`{"type":"minimap_route","available":false}`)
@@ -83,15 +94,18 @@ func (s *routeStore) get(now time.Time) []byte {
 }
 
 type relayHandler struct {
-	token string
-	store *routeStore
+	token    string
+	store    *routeStore
+	pairings *pairingManager
 }
 
 func newHandler(token string, store *routeStore) http.Handler {
-	r := &relayHandler{token: token, store: store}
+	r := &relayHandler{token: token, store: store, pairings: newPairingManager()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", r.health)
 	mux.HandleFunc("/route", r.route)
+	mux.HandleFunc("/pair/start", r.pairStart)
+	mux.HandleFunc("/pair/claim", r.pairClaim)
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found")
 	})
@@ -118,7 +132,7 @@ func (r *relayHandler) health(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *relayHandler) route(w http.ResponseWriter, req *http.Request) {
-	if !r.authorized(req) {
+	if !r.authorizedRoute(req) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -140,13 +154,264 @@ func (r *relayHandler) route(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *relayHandler) authorized(req *http.Request) bool {
+	provided := bearerToken(req)
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(r.token)) == 1
+}
+
+func bearerToken(req *http.Request) string {
 	header := strings.TrimSpace(req.Header.Get("Authorization"))
 	const prefix = "Bearer "
 	if !strings.HasPrefix(header, prefix) {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(header, prefix))
+}
+
+func (r *relayHandler) authorizedRoute(req *http.Request) bool {
+	provided := bearerToken(req)
+	if subtle.ConstantTimeCompare([]byte(provided), []byte(r.token)) == 1 {
+		return true
+	}
+	// A paired watch receives a derived read-only credential. The iPhone keeps
+	// using the master token for publishing and clearing routes.
+	return req.Method == http.MethodGet && validWatchToken(provided, r.token)
+}
+
+type pairSession struct {
+	code      string
+	nonce     string
+	expiresAt time.Time
+	claimed   bool
+}
+
+type requestWindow struct {
+	started time.Time
+	count   int
+}
+
+type pairingManager struct {
+	mu          sync.Mutex
+	byCode      map[string]*pairSession
+	byNonce     map[string]*pairSession
+	startWindow requestWindow
+	claimWindow requestWindow
+}
+
+func newPairingManager() *pairingManager {
+	return &pairingManager{byCode: make(map[string]*pairSession), byNonce: make(map[string]*pairSession)}
+}
+
+func (m *pairingManager) allow(window *requestWindow, now time.Time, limit int) bool {
+	if window.started.IsZero() || now.Sub(window.started) >= time.Minute || now.Before(window.started) {
+		window.started = now
+		window.count = 0
+	}
+	if window.count >= limit {
 		return false
 	}
-	provided := strings.TrimSpace(strings.TrimPrefix(header, prefix))
-	return subtle.ConstantTimeCompare([]byte(provided), []byte(r.token)) == 1
+	window.count++
+	return true
+}
+
+func (m *pairingManager) prune(now time.Time) {
+	for code, session := range m.byCode {
+		if !now.Before(session.expiresAt) {
+			delete(m.byCode, code)
+			delete(m.byNonce, session.nonce)
+		}
+	}
+}
+
+func (m *pairingManager) start(now time.Time) (*pairSession, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.prune(now)
+	if !m.allow(&m.startWindow, now, pairStartLimit) || len(m.byCode) >= maxPairSessions {
+		return nil, errPairRateLimited
+	}
+
+	for attempts := 0; attempts < 10; attempts++ {
+		number, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
+		if err != nil {
+			return nil, err
+		}
+		code := fmt.Sprintf("%06d", number.Int64())
+		if _, exists := m.byCode[code]; exists {
+			continue
+		}
+		nonceBytes := make([]byte, pairNonceSize)
+		if _, err := rand.Read(nonceBytes); err != nil {
+			return nil, err
+		}
+		session := &pairSession{code: code, nonce: base64.RawURLEncoding.EncodeToString(nonceBytes), expiresAt: now.Add(pairCodeTTL)}
+		m.byCode[code] = session
+		m.byNonce[session.nonce] = session
+		return session, nil
+	}
+	return nil, errors.New("unable to allocate pairing code")
+}
+
+func (m *pairingManager) claim(code string, now time.Time) (*pairSession, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.prune(now)
+	if !m.allow(&m.claimWindow, now, pairClaimLimit) {
+		return nil, errPairRateLimited
+	}
+	session := m.byCode[code]
+	if session == nil {
+		return nil, errPairNotFound
+	}
+	if session.claimed {
+		return nil, errPairAlreadyClaimed
+	}
+	session.claimed = true
+	return session, nil
+}
+
+func (m *pairingManager) status(nonce string, now time.Time) (*pairSession, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.prune(now)
+	session := m.byNonce[nonce]
+	if session == nil || !validPairNonce(nonce) {
+		return nil, false
+	}
+	snapshot := *session
+	return &snapshot, true
+}
+
+var (
+	errPairRateLimited    = errors.New("pairing_rate_limited")
+	errPairNotFound       = errors.New("pairing_not_found")
+	errPairAlreadyClaimed = errors.New("pairing_already_claimed")
+)
+
+func validPairNonce(encoded string) bool {
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	return err == nil && len(decoded) == pairNonceSize
+}
+
+func makeWatchToken(masterToken, encodedNonce string) (string, error) {
+	nonce, err := base64.RawURLEncoding.DecodeString(encodedNonce)
+	if err != nil || len(nonce) != pairNonceSize {
+		return "", errors.New("invalid_pairing_nonce")
+	}
+	mac := hmac.New(sha256.New, []byte(masterToken))
+	_, _ = mac.Write(append([]byte("minimap-watch-v1:"), nonce...))
+	signature := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return "mmw1." + encodedNonce + "." + signature, nil
+}
+
+func validWatchToken(token, masterToken string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || parts[0] != "mmw1" {
+		return false
+	}
+	expected, err := makeWatchToken(masterToken, parts[1])
+	if err != nil {
+		return false
+	}
+	expectedSignature := strings.Split(expected, ".")[2]
+	return subtle.ConstantTimeCompare([]byte(parts[2]), []byte(expectedSignature)) == 1
+}
+
+func (r *relayHandler) pairStart(w http.ResponseWriter, req *http.Request) {
+	switch req.Method {
+	case http.MethodPost:
+		session, err := r.pairings.start(time.Now())
+		if errors.Is(err, errPairRateLimited) {
+			writeError(w, http.StatusTooManyRequests, "pairing_rate_limited")
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "pairing_unavailable")
+			return
+		}
+		writeJSON(w, http.StatusOK, struct {
+			Code      string `json:"code"`
+			Session   string `json:"session"`
+			ExpiresIn int    `json:"expiresIn"`
+		}{session.code, session.nonce, int(pairCodeTTL.Seconds())})
+	case http.MethodGet:
+		nonce := strings.TrimSpace(req.Header.Get("X-MiniMap-Pair-Session"))
+		session, exists := r.pairings.status(nonce, time.Now())
+		if !exists {
+			writeError(w, http.StatusGone, "pairing_expired")
+			return
+		}
+		if !session.claimed {
+			writeJSON(w, http.StatusAccepted, struct {
+				Status string `json:"status"`
+			}{"pending"})
+			return
+		}
+		token, err := makeWatchToken(r.token, session.nonce)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "pairing_unavailable")
+			return
+		}
+		writeJSON(w, http.StatusOK, struct {
+			Status string `json:"status"`
+			Token  string `json:"token"`
+		}{"paired", token})
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+	}
+}
+
+func (r *relayHandler) pairClaim(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	if !r.authorized(req) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	mediaType, _, err := mime.ParseMediaType(req.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, "content_type_must_be_json")
+		return
+	}
+	req.Body = http.MaxBytesReader(w, req.Body, 128)
+	body, err := io.ReadAll(req.Body)
+	if err != nil || !json.Valid(body) {
+		writeError(w, http.StatusBadRequest, "invalid_pairing_request")
+		return
+	}
+	var payload struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || len(payload.Code) != 6 || !digitsOnly(payload.Code) {
+		writeError(w, http.StatusBadRequest, "invalid_pairing_code")
+		return
+	}
+	if _, err := r.pairings.claim(payload.Code, time.Now()); err != nil {
+		switch {
+		case errors.Is(err, errPairRateLimited):
+			writeError(w, http.StatusTooManyRequests, "pairing_rate_limited")
+		case errors.Is(err, errPairAlreadyClaimed):
+			writeError(w, http.StatusConflict, "pairing_already_claimed")
+		default:
+			writeError(w, http.StatusNotFound, "pairing_not_found_or_expired")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		OK bool `json:"ok"`
+	}{true})
+}
+
+func digitsOnly(value string) bool {
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *relayHandler) publish(w http.ResponseWriter, req *http.Request) {
@@ -315,4 +580,10 @@ func writeError(w http.ResponseWriter, status int, code string) {
 	_ = json.NewEncoder(w).Encode(struct {
 		Error string `json:"error"`
 	}{Error: code})
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
 }
