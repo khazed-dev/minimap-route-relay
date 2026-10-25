@@ -16,11 +16,11 @@ The service keeps one route in RAM and expires it after five minutes by default.
 ## Deploy on Botkeep
 
 1. Create a Go application and choose this GitHub repository as its source.
-2. Set the start command to `go run .` (or build a binary with `go build -o server .` and run it).
+2. Set the Startup command to `go run .`.
 3. Add an environment variable named `MINIMAP_RELAY_TOKEN` with a random value of at least 32 characters. Keep the same value private and configure the iPhone publisher and watch reader with it.
 4. Deploy. Use the HTTPS domain assigned by the host for both clients; do not configure an IP address.
 
-Botkeep provides the process port in `SERVER_PORT`; the server binds to that port on all interfaces. Configure an HTTPS hostname in Botkeep's Domains tab and use that hostname from both clients. Do not hard-code a port or commit the token.
+The process reads `.env` from its working directory at startup when that file exists. Keep Botkeep's Working Directory at the repository root (the directory containing `go.mod`) and use `go run .` as the Startup command. Variables already injected into the process environment take precedence over `.env` and are never overwritten. Startup logs only confirm whether `.env` was loaded; they never print variable values. Botkeep provides the process port in `SERVER_PORT`; the server binds to that port on all interfaces. Configure an HTTPS hostname in Botkeep's Domains tab and use that hostname from both clients. Do not hard-code a port or commit the token.
 
 ## Local development
 
